@@ -42,7 +42,8 @@
       {
         "provider": "github",
         "owner": "daveranan",
-        "repo": "local-transcriber"
+        "repo": "local-transcriber",
+        "releaseType": "release"
       }
     ]
   },
