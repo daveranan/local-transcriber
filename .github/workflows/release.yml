@@ -1,9 +1,13 @@
-name: Release
+name: Build and Release
 
 on:
   push:
+    branches:
+      - master
+      - main
     tags:
       - "v*"
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -13,11 +17,49 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-node@v4
         with:
           node-version: 24
           cache: npm
-      - run: npm ci
-      - run: npm run publish
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Use tag as app version
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        run: |
+          $version = "${{ github.ref_name }}".TrimStart("v")
+          node -e "const fs=require('fs'); const version=process.argv[1]; for (const file of ['package.json','package-lock.json']) { const data=JSON.parse(fs.readFileSync(file,'utf8')); data.version=version; if (data.packages && data.packages['']) data.packages[''].version=version; fs.writeFileSync(file, JSON.stringify(data,null,2)+'\n'); }" $version
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Install backend Python environment
+        shell: pwsh
+        run: |
+          python -m venv .venv
+          .\.venv\Scripts\python.exe -m pip install --upgrade pip
+          .\.venv\Scripts\python.exe -m pip install -r backend\requirements.txt
+
+      - name: Build installer artifact
+        if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
+        run: npm run dist
+
+      - name: Publish GitHub release
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: npm run publish
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: Livescriber-Windows-${{ github.ref_name }}
+          path: |
+            release/*.exe
+            release/*.blockmap
+            release/latest.yml
+          if-no-files-found: ignore

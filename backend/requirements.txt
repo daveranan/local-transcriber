@@ -1,6 +1,10 @@
-websockets>=12.0
-numpy>=1.26
-faster-whisper>=1.1.0
+websockets==16.0
+numpy==2.4.6
+faster-whisper==1.2.1
+nvidia-cublas-cu12==12.9.2.10
+nvidia-cudnn-cu12==9.22.0.52
+nvidia-cuda-runtime-cu12==12.9.79
+nvidia-cuda-nvrtc-cu12==12.9.86
 
 # Optional speaker diarization path. Requires a Hugging Face token for most pyannote models.
 # pyannote.audio>=3.3.0
