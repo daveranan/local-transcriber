@@ -13,7 +13,7 @@
     "dev": "concurrently -k \"vite --host 127.0.0.1\" \"wait-on http://127.0.0.1:5173 && cross-env ELECTRON_RENDERER_URL=http://127.0.0.1:5173 electron .\"",
     "build": "tsc --noEmit && vite build",
     "build:test": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-and-test.ps1",
-    "dist": "npm run build && electron-builder",
+    "dist": "npm run build && electron-builder --publish never",
     "publish": "npm run build && electron-builder --publish always",
     "start": "electron ."
   },
