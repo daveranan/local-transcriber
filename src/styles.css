@@ -379,6 +379,11 @@ select {
   color: #d1d5db;
 }
 
+.status-tile.warn svg,
+.status-tile.warn strong {
+  color: #f4f7fb;
+}
+
 .status-tile.muted svg {
   color: #9aa7b8;
 }

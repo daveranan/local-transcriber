@@ -1,7 +1,9 @@
 const { app, BrowserWindow, Menu, Tray, clipboard, desktopCapturer, dialog, ipcMain, nativeImage, session, globalShortcut } = require("electron");
 const { autoUpdater } = require("electron-updater");
 const { spawn } = require("node:child_process");
+const crypto = require("node:crypto");
 const fs = require("node:fs");
+const https = require("node:https");
 const path = require("node:path");
 
 let mainWindow;
@@ -10,9 +12,14 @@ let isQuitting = false;
 let selectedSourceId = null;
 let serviceProcess = null;
 let serviceStatus = { running: false, port: 8765, pid: null };
+let backendInstallPromise = null;
 
 const appDir = app.isPackaged ? app.getAppPath() : path.join(__dirname, "..");
 const resourceDir = app.isPackaged ? process.resourcesPath : appDir;
+const backendRuntimeDir = path.join(process.env.LOCALAPPDATA || app.getPath("userData"), "Livescriber", "backend-runtime");
+const embeddedPythonVersion = "3.13.5";
+const embeddedPythonUrl = `https://www.python.org/ftp/python/${embeddedPythonVersion}/python-${embeddedPythonVersion}-embed-amd64.zip`;
+const getPipUrl = "https://bootstrap.pypa.io/get-pip.py";
 
 function createWindow() {
   mainWindow = new BrowserWindow({
@@ -84,9 +91,10 @@ function configureMediaPermissions() {
 
 function getPythonCommand() {
   const candidates = [
-    path.join(resourceDir, ".venv", "Scripts", "python.exe"),
-    path.join(path.dirname(process.execPath), ".venv", "Scripts", "python.exe"),
     path.join(appDir, ".venv", "Scripts", "python.exe"),
+    path.join(resourceDir, ".venv", "Scripts", "python.exe"),
+    path.join(backendRuntimeDir, "python", "python.exe"),
+    path.join(path.dirname(process.execPath), ".venv", "Scripts", "python.exe"),
     path.join(resourceDir, "venv", "Scripts", "python.exe"),
     path.join(appDir, "venv", "Scripts", "python.exe"),
   ];
@@ -97,7 +105,136 @@ function broadcast(channel, payload) {
   BrowserWindow.getAllWindows().forEach((win) => win.webContents.send(channel, payload));
 }
 
-function startService() {
+function logBackendSetup(text, stream = "status") {
+  broadcast("service:log", { stream, text });
+}
+
+function psQuote(value) {
+  return `'${String(value).replace(/'/g, "''")}'`;
+}
+
+function requirementHash() {
+  const requirementsPath = path.join(resourceDir, "backend", "requirements.txt");
+  const text = fs.readFileSync(requirementsPath, "utf8");
+  return crypto.createHash("sha256").update(text).digest("hex");
+}
+
+function downloadFile(url, destination) {
+  return new Promise((resolve, reject) => {
+    fs.mkdirSync(path.dirname(destination), { recursive: true });
+    const file = fs.createWriteStream(destination);
+    const request = (nextUrl) => {
+      https.get(nextUrl, (response) => {
+        if ([301, 302, 303, 307, 308].includes(response.statusCode) && response.headers.location) {
+          request(new URL(response.headers.location, nextUrl).toString());
+          return;
+        }
+        if (response.statusCode !== 200) {
+          reject(new Error(`Download failed ${response.statusCode}: ${nextUrl}`));
+          return;
+        }
+        response.pipe(file);
+        file.on("finish", () => file.close(resolve));
+      }).on("error", reject);
+    };
+    file.on("error", reject);
+    request(url);
+  });
+}
+
+function runBackendCommand(command, args, options = {}) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(command, args, { windowsHide: true, ...options });
+    let stderr = "";
+    child.stdout?.on("data", (chunk) => logBackendSetup(chunk.toString().trim(), "stdout"));
+    child.stderr?.on("data", (chunk) => {
+      const text = chunk.toString();
+      stderr += text;
+      logBackendSetup(text.trim(), "stderr");
+    });
+    child.on("error", reject);
+    child.on("exit", (code) => {
+      if (code === 0) {
+        resolve();
+      } else {
+        reject(new Error(`${command} exited with ${code}: ${stderr.trim()}`));
+      }
+    });
+  });
+}
+
+async function ensureEmbeddedPython() {
+  const pythonDir = path.join(backendRuntimeDir, "python");
+  const pythonExe = path.join(pythonDir, "python.exe");
+  if (fs.existsSync(pythonExe)) {
+    return pythonExe;
+  }
+
+  const zipPath = path.join(backendRuntimeDir, `python-${embeddedPythonVersion}-embed-amd64.zip`);
+  logBackendSetup(`downloading Python ${embeddedPythonVersion}`);
+  await downloadFile(embeddedPythonUrl, zipPath);
+
+  fs.rmSync(pythonDir, { recursive: true, force: true });
+  fs.mkdirSync(pythonDir, { recursive: true });
+  logBackendSetup("extracting Python runtime");
+  await runBackendCommand("powershell.exe", [
+    "-NoProfile",
+    "-ExecutionPolicy",
+    "Bypass",
+    "-Command",
+    `Expand-Archive -LiteralPath ${psQuote(zipPath)} -DestinationPath ${psQuote(pythonDir)} -Force`,
+  ]);
+
+  const pthPath = fs.readdirSync(pythonDir).find((name) => name.endsWith("._pth"));
+  if (pthPath) {
+    const fullPath = path.join(pythonDir, pthPath);
+    const pth = fs.readFileSync(fullPath, "utf8");
+    let nextPth = pth.includes("import site") ? pth.replace("#import site", "import site") : `${pth.trimEnd()}\nimport site\n`;
+    if (!nextPth.includes("Lib/site-packages")) {
+      nextPth = nextPth.replace("import site", "Lib/site-packages\nimport site");
+    }
+    fs.writeFileSync(fullPath, nextPth);
+  }
+
+  const getPipPath = path.join(backendRuntimeDir, "get-pip.py");
+  logBackendSetup("downloading pip bootstrap");
+  await downloadFile(getPipUrl, getPipPath);
+  logBackendSetup("installing pip");
+  await runBackendCommand(pythonExe, [getPipPath, "--no-warn-script-location"], { cwd: backendRuntimeDir });
+  return pythonExe;
+}
+
+async function ensureBackendRuntime() {
+  if (!app.isPackaged) {
+    return getPythonCommand();
+  }
+  if (backendInstallPromise) {
+    return backendInstallPromise;
+  }
+
+  backendInstallPromise = (async () => {
+    const markerPath = path.join(backendRuntimeDir, "requirements.sha256");
+    const expectedHash = requirementHash();
+    const pythonExe = await ensureEmbeddedPython();
+    const currentHash = fs.existsSync(markerPath) ? fs.readFileSync(markerPath, "utf8").trim() : "";
+    if (currentHash !== expectedHash) {
+      logBackendSetup("installing transcription backend dependencies");
+      await runBackendCommand(pythonExe, ["-m", "pip", "install", "--upgrade", "pip"], { cwd: backendRuntimeDir });
+      await runBackendCommand(pythonExe, ["-m", "pip", "install", "-r", path.join(resourceDir, "backend", "requirements.txt")], { cwd: backendRuntimeDir });
+      fs.writeFileSync(markerPath, expectedHash, "utf8");
+    }
+    await runBackendCommand(pythonExe, ["-c", "import websockets, numpy, faster_whisper; print('backend runtime ready')"], { cwd: backendRuntimeDir });
+    return pythonExe;
+  })();
+
+  try {
+    return await backendInstallPromise;
+  } finally {
+    backendInstallPromise = null;
+  }
+}
+
+async function startService() {
   if (serviceProcess) return serviceStatus;
 
   const script = path.join(resourceDir, "backend", "transcriber_service.py");
@@ -106,7 +243,17 @@ function startService() {
   }
 
   const port = Number(process.env.LIVE_SCRIBER_PORT ?? 8765);
-  const python = getPythonCommand();
+  serviceStatus = { running: false, installing: true, port, pid: null };
+  broadcast("service:status", serviceStatus);
+  let python;
+  try {
+    python = await ensureBackendRuntime();
+  } catch (error) {
+    serviceStatus = { running: false, installing: false, port, pid: null };
+    broadcast("service:status", serviceStatus);
+    logBackendSetup(`backend setup failed: ${error.message || error}`, "stderr");
+    throw error;
+  }
   serviceProcess = spawn(python, [script], {
     cwd: resourceDir,
     env: {
@@ -118,7 +265,7 @@ function startService() {
     windowsHide: true,
   });
 
-  serviceStatus = { running: true, port, pid: serviceProcess.pid };
+  serviceStatus = { running: true, installing: false, port, pid: serviceProcess.pid };
   broadcast("service:status", serviceStatus);
 
   serviceProcess.stdout.on("data", (chunk) => {
@@ -132,7 +279,7 @@ function startService() {
   serviceProcess.on("exit", (code, signal) => {
     broadcast("service:log", { stream: "status", text: `transcriber exited code=${code} signal=${signal}` });
     serviceProcess = null;
-    serviceStatus = { running: false, port, pid: null };
+    serviceStatus = { running: false, installing: false, port, pid: null };
     broadcast("service:status", serviceStatus);
   });
 
@@ -144,7 +291,7 @@ function stopService() {
     serviceProcess.kill();
     serviceProcess = null;
   }
-  serviceStatus = { ...serviceStatus, running: false, pid: null };
+  serviceStatus = { ...serviceStatus, running: false, installing: false, pid: null };
   broadcast("service:status", serviceStatus);
   return serviceStatus;
 }

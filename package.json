@@ -1,6 +1,6 @@
 {
   "name": "livescriber",
-  "version": "0.1.6",
+  "version": "0.1.8",
   "private": true,
   "author": "daveranan",
   "description": "Local desktop and microphone transcription.",
@@ -33,15 +33,6 @@
       {
         "from": "backend",
         "to": "backend"
-      },
-      {
-        "from": ".venv",
-        "to": ".venv",
-        "filter": [
-          "**/*",
-          "!**/__pycache__/**",
-          "!**/*.pyc"
-        ]
       }
     ],
     "win": {

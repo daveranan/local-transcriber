@@ -23,10 +23,6 @@ jobs:
           node-version: 24
           cache: npm
 
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.13"
-
       - name: Use tag as app version
         if: startsWith(github.ref, 'refs/tags/v')
         shell: pwsh
@@ -36,13 +32,6 @@ jobs:
 
       - name: Install frontend dependencies
         run: npm ci
-
-      - name: Install backend Python environment
-        shell: pwsh
-        run: |
-          python -m venv .venv
-          .\.venv\Scripts\python.exe -m pip install --upgrade pip
-          .\.venv\Scripts\python.exe -m pip install -r backend\requirements.txt
 
       - name: Build installer artifact
         if: ${{ !startsWith(github.ref, 'refs/tags/v') }}

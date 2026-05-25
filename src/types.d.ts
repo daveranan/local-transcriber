@@ -7,6 +7,7 @@ export type CaptureSource = {
 
 export type ServiceStatus = {
   running: boolean;
+  installing?: boolean;
   port: number;
   pid: number | null;
 };

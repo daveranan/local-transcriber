@@ -512,7 +512,7 @@ export function App() {
         </div>
 
         <div className="status-grid">
-          <StatusTile icon={<Cpu size={17} />} label="Model" value={serviceStatus.running ? `PID ${serviceStatus.pid}` : "Stopped"} tone={serviceStatus.running ? "good" : "muted"} />
+          <StatusTile icon={<Cpu size={17} />} label="Model" value={serviceStatus.installing ? "Installing backend" : serviceStatus.running ? `PID ${serviceStatus.pid}` : "Stopped"} tone={serviceStatus.running ? "good" : serviceStatus.installing ? "warn" : "muted"} />
           <StatusTile icon={<Activity size={17} />} label="Socket" value={socketState} tone={socketState === "online" ? "good" : socketState === "error" ? "bad" : "muted"} />
           <StatusTile icon={<Mic2 size={17} />} label="Capture" value={captureState} tone={captureState === "running" ? "good" : "muted"} />
         </div>
@@ -666,7 +666,7 @@ export function App() {
   );
 }
 
-function StatusTile({ icon, label, value, tone }: { icon: ReactNode; label: string; value: string; tone: "good" | "bad" | "muted" }) {
+function StatusTile({ icon, label, value, tone }: { icon: ReactNode; label: string; value: string; tone: "good" | "bad" | "warn" | "muted" }) {
   return (
     <div className={`status-tile ${tone}`}>
       {icon}

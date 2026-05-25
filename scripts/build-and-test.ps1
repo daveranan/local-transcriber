@@ -8,6 +8,26 @@ $Root = Split-Path -Parent $PSScriptRoot
 Set-Location $Root
 
 Get-Process -Name Livescriber -ErrorAction SilentlyContinue | Stop-Process -Force
+Get-CimInstance Win32_Process |
+  Where-Object { $_.CommandLine -like "*Programs\Livescriber\resources\backend*" -or $_.CommandLine -like "*Programs\Livescriber\resources\.venv*" } |
+  ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+Start-Sleep -Milliseconds 700
+
+$OldBundledVenv = Join-Path $env:LOCALAPPDATA "Programs\Livescriber\resources\.venv"
+if (Test-Path $OldBundledVenv) {
+  try {
+    Remove-Item -LiteralPath $OldBundledVenv -Recurse -Force
+  } catch {
+    Write-Warning "Could not remove old bundled backend: $($_.Exception.Message)"
+  }
+}
+
+$ReleaseDir = Join-Path $Root "release"
+if (Test-Path $ReleaseDir) {
+  Get-ChildItem -LiteralPath $ReleaseDir -File |
+    Where-Object { $_.Name -match '^Livescriber.*\.(exe|blockmap)$|^latest\.yml$|^builder-debug\.yml$' } |
+    Remove-Item -Force
+}
 
 $Version = node scripts\bump-version.cjs
 Write-Host "Building Livescriber $Version"
@@ -15,7 +35,6 @@ Write-Host "Building Livescriber $Version"
 npm install
 npm run dist
 
-$ReleaseDir = Join-Path $Root "release"
 $AppPath = Join-Path $ReleaseDir "win-unpacked\Livescriber.exe"
 $Installer = Get-ChildItem -Path $ReleaseDir -Filter "*.exe" -File |
   Where-Object { $_.Name -match "Setup|Installer" } |
