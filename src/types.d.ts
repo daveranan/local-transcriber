@@ -45,23 +45,28 @@ export type MediaFile = {
 };
 
 export type LiveScriberBridge = {
+  getAppVersion: () => Promise<string>;
   getSources: () => Promise<CaptureSource[]>;
   setCaptureSource: (sourceId: string) => Promise<boolean>;
   chooseMediaFile: () => Promise<MediaFile | null>;
+  createFileTranscript: (payload: { directory: string; fileName: string }) => Promise<{ directory: string; transcriptPath: string }>;
   writeClipboardText: (text: string) => Promise<boolean>;
   startService: () => Promise<ServiceStatus>;
   stopService: () => Promise<ServiceStatus>;
   getServiceStatus: () => Promise<ServiceStatus>;
   chooseExportDirectory: () => Promise<string | null>;
   getDefaultExportDirectory: () => Promise<string>;
+  openExportDirectory: (directory: string) => Promise<void>;
   saveSessionExport: (payload: {
     directory: string;
     baseName: string;
     transcriptText?: string;
     audioBase64?: string;
+    audioSourcePath?: string;
     includeText?: boolean;
     includeAudio?: boolean;
-  }) => Promise<{ textPath: string | null; audioPath: string | null }>;
+  }) => Promise<{ textPath: string | null; audioPath: string | null; audioError?: string }>;
+  showExportInFolder: (filePath: string) => Promise<void>;
   checkForUpdates: () => Promise<{ status: string }>;
   installUpdate: () => Promise<void>;
   minimizeWindow: () => Promise<void>;

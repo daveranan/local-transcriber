@@ -1,6 +1,6 @@
 {
   "name": "livescriber",
-  "version": "0.1.8",
+  "version": "1.0.3",
   "private": true,
   "author": "daveranan",
   "description": "Local desktop and microphone transcription.",
@@ -11,10 +11,11 @@
   "main": "electron/main.cjs",
   "scripts": {
     "dev": "concurrently -k \"vite --host 127.0.0.1\" \"wait-on http://127.0.0.1:5173 && cross-env ELECTRON_RENDERER_URL=http://127.0.0.1:5173 electron .\"",
-    "build": "tsc --noEmit && vite build",
+    "build": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/run-limited.ps1 node scripts/build.cjs",
     "build:test": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-and-test.ps1",
-    "dist": "npm run build && electron-builder --publish never",
-    "publish": "npm run build && electron-builder --publish always",
+    "test:renderer": "npm run build && powershell -NoProfile -ExecutionPolicy Bypass -File scripts/run-limited.ps1 node node_modules/electron/cli.js scripts/test-renderer.cjs",
+    "dist": "npm run build && powershell -NoProfile -ExecutionPolicy Bypass -File scripts/run-limited.ps1 node node_modules/electron-builder/out/cli/cli.js --publish never",
+    "publish": "npm run build && powershell -NoProfile -ExecutionPolicy Bypass -File scripts/run-limited.ps1 node node_modules/electron-builder/out/cli/cli.js --publish always",
     "start": "electron ."
   },
   "build": {
@@ -32,7 +33,12 @@
     "extraResources": [
       {
         "from": "backend",
-        "to": "backend"
+        "to": "backend",
+        "filter": [
+          "**/*",
+          "!**/__pycache__/**",
+          "!test_*.py"
+        ]
       }
     ],
     "win": {

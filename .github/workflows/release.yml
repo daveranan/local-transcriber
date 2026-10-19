@@ -12,6 +12,10 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: livescriber-windows-build
+  cancel-in-progress: false
+
 jobs:
   windows:
     runs-on: windows-latest
@@ -23,15 +27,29 @@ jobs:
           node-version: 24
           cache: npm
 
-      - name: Use tag as app version
+      - name: Verify tag matches app version
         if: startsWith(github.ref, 'refs/tags/v')
         shell: pwsh
         run: |
           $version = "${{ github.ref_name }}".TrimStart("v")
-          node -e "const fs=require('fs'); const version=process.argv[1]; for (const file of ['package.json','package-lock.json']) { const data=JSON.parse(fs.readFileSync(file,'utf8')); data.version=version; if (data.packages && data.packages['']) data.packages[''].version=version; fs.writeFileSync(file, JSON.stringify(data,null,2)+'\n'); }" $version
+          node -e "const fs=require('fs'); const version=process.argv[1]; for (const file of ['package.json','package-lock.json']) { const data=JSON.parse(fs.readFileSync(file,'utf8')); if (data.version !== version || (data.packages && data.packages[''].version !== version)) throw new Error(file + ' must match release tag ' + version); }" $version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Install frontend dependencies
         run: npm ci
+
+      - name: Verify renderer file transcription and exports
+        run: npm run test:renderer
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Install backend test dependencies
+        run: python -m pip install --only-binary=:all: numpy==2.4.6 websockets==16.0 av==17.0.1
+
+      - name: Verify file streaming and speaker assignment
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File scripts/run-limited.ps1 python -B backend/test_file_transcription.py
 
       - name: Build installer artifact
         if: ${{ !startsWith(github.ref, 'refs/tags/v') }}

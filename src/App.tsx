@@ -27,7 +27,7 @@ import {
 } from "lucide-react";
 import { arrayBufferToBase64, downsampleFloat32, floatToPcm16 } from "./lib/audio";
 import { getBridge } from "./lib/bridge";
-import type { AudioInputDevice, AudioStats, CaptureSource, ServiceLog, ServiceStatus, TranscriptSegment } from "./types";
+import type { AudioInputDevice, AudioStats, CaptureSource, MediaFile, ServiceLog, ServiceStatus, TranscriptSegment } from "./types";
 
 const TARGET_SAMPLE_RATE = 16_000;
 
@@ -56,6 +56,7 @@ const emptyAudioStats = (): AudioStats => ({ tracks: 0, peak: 0, rms: 0, packets
 const bridge = getBridge();
 
 export function App() {
+  const [appVersion, setAppVersion] = useState("");
   const [sources, setSources] = useState<CaptureSource[]>([]);
   const [selectedSourceId, setSelectedSourceId] = useState("");
   const [serviceStatus, setServiceStatus] = useState<ServiceStatus>(defaultStatus);
@@ -69,6 +70,7 @@ export function App() {
   const [exportDirectory, setExportDirectory] = useState(() => localStorage.getItem("exportDirectory") || "");
   const [autoExport, setAutoExport] = useState(() => localStorage.getItem("autoExport") !== "false");
   const [recordAudio, setRecordAudio] = useState(() => localStorage.getItem("recordAudio") !== "false");
+  const [fileSpeakers, setFileSpeakers] = useState(() => localStorage.getItem("fileSpeakers") !== "false");
   const [updateStatus, setUpdateStatus] = useState<Record<string, unknown>>({ status: "idle" });
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [logOpen, setLogOpen] = useState(false);
@@ -76,13 +78,24 @@ export function App() {
   const [activeHitIndex, setActiveHitIndex] = useState(0);
   const [lastAudioChunks, setLastAudioChunks] = useState<Blob[]>([]);
   const [fileProgress, setFileProgress] = useState<FileProgress | null>(null);
+  const [mediaFile, setMediaFile] = useState<MediaFile | null>(null);
+  const [exporting, setExporting] = useState(false);
+  const [notice, setNotice] = useState<{ text: string; error?: boolean; path?: string } | null>(null);
   const [audioStats, setAudioStats] = useState({
     desktop: emptyAudioStats(),
     mic: emptyAudioStats(),
   });
   const runtime = useRef<RuntimeRefs>({});
+  // Keep the complete session, including messages received before React renders.
+  const segmentsRef = useRef<TranscriptSegment[]>([]);
+  const mediaFileRef = useRef<MediaFile | null>(null);
+  const fileTranscriptPath = useRef<string | null>(null);
+  const exportBusy = useRef(false);
+  const exportSettings = useRef({ autoExport, exportDirectory });
+  exportSettings.current = { autoExport, exportDirectory };
 
   useEffect(() => {
+    bridge.getAppVersion().then(setAppVersion);
     refreshSources();
     refreshAudioInputs();
     bridge.getServiceStatus().then(setServiceStatus);
@@ -149,6 +162,14 @@ export function App() {
     localStorage.setItem("exportDirectory", directory);
   }
 
+  async function openExportDirectory() {
+    try {
+      await bridge.openExportDirectory(exportDirectory);
+    } catch (error) {
+      setNotice({ text: `Could not open export folder: ${String(error)}`, error: true });
+    }
+  }
+
   function updateAutoExport(enabled: boolean) {
     setAutoExport(enabled);
     localStorage.setItem("autoExport", String(enabled));
@@ -159,7 +180,7 @@ export function App() {
     localStorage.setItem("recordAudio", String(enabled));
   }
 
-  async function startConfiguredSocket() {
+  async function startConfiguredSocket(fileSession = false) {
     let activeStatus = serviceStatus;
     if (!activeStatus.running) {
       activeStatus = await bridge.startService();
@@ -170,6 +191,7 @@ export function App() {
     runtime.current.socket = socket;
 
     socket.onmessage = (event) => {
+      if (runtime.current.socket !== socket) return;
       const message = JSON.parse(event.data);
       if (message.type === "segment") {
         upsertSegment(message.segment);
@@ -179,23 +201,39 @@ export function App() {
       }
       if (message.type === "status") {
         setLogs((current) => [...current.slice(-120), { stream: "status", text: message.message }]);
-        if (typeof message.message === "string" && message.message.startsWith("file transcription complete")) {
-          setCaptureState("idle");
-          socket.close();
-          runtime.current.socket = undefined;
+      }
+      if (message.type === "file_complete" || message.type === "file_error") {
+        runtime.current.socket = undefined;
+        setCaptureState("idle");
+        socket.close();
+        if (message.type === "file_error") {
+          setFileProgress((current) => current && { ...current, stage: "error", percent: null });
+          setNotice({ text: `${message.message}${fileTranscriptPath.current ? " Completed text is saved to the TXT file." : ""}`, error: true, path: fileTranscriptPath.current ?? undefined });
+        } else if (message.transcriptPath) {
+          setNotice({ text: `Saved ${message.transcriptPath} · ${message.segments} segments · ${message.speakers ?? 1} speakers`, path: message.transcriptPath });
+        } else {
+          void exportSession({ includeText: true, includeAudio: false });
         }
       }
     };
 
     socket.onerror = () => setSocketState("error");
-    socket.onclose = () => setSocketState("offline");
+    socket.onclose = () => {
+      setSocketState("offline");
+      if (fileSession && runtime.current.socket === socket) {
+        runtime.current.socket = undefined;
+        setCaptureState("idle");
+        setFileProgress((current) => current && { ...current, stage: "error", percent: null });
+        setNotice({ text: "File transcription was interrupted. Completed text is saved in the TXT file.", path: fileTranscriptPath.current ?? undefined, error: true });
+      }
+    };
 
     setSocketState("online");
     socket.send(JSON.stringify({
       type: "configure",
       sampleRate: TARGET_SAMPLE_RATE,
       language: language === "auto" ? null : language,
-      diarization: true,
+      diarization: fileSession && fileSpeakers,
     }));
 
     return socket;
@@ -211,6 +249,7 @@ export function App() {
 
     try {
       await startConfiguredSocket();
+      clearTranscript();
 
       const desktopStream = await captureDesktopStream(selectedSourceId, (text) => {
         setLogs((current) => [...current.slice(-120), { stream: "status", text }]);
@@ -261,14 +300,25 @@ export function App() {
     setLogs((current) => [...current.slice(-120), { stream: "status", text: `selected file: ${file.name}` }]);
 
     try {
-      const socket = await startConfiguredSocket();
+      const output = await bridge.createFileTranscript({ directory: exportSettings.current.exportDirectory, fileName: file.name });
+      const socket = await startConfiguredSocket(true);
+      clearTranscript();
+      fileTranscriptPath.current = output.transcriptPath;
+      setExportDirectory(output.directory);
+      localStorage.setItem("exportDirectory", output.directory);
+      setNotice({ text: `Saving TXT automatically: ${output.transcriptPath}`, path: output.transcriptPath });
+      mediaFileRef.current = file;
+      setMediaFile(file);
       setCaptureState("running");
       socket.send(JSON.stringify({
         type: "file",
         source: "desktop",
         path: file.path,
+        transcriptPath: output.transcriptPath,
       }));
     } catch (error) {
+      setNotice({ text: `Could not transcribe file: ${String(error)}`, error: true });
+      setFileProgress((current) => current && { ...current, stage: "error", percent: null });
       setLogs((current) => [...current.slice(-120), { stream: "stderr", text: String(error) }]);
       await stopCapture();
     }
@@ -279,35 +329,43 @@ export function App() {
     setCaptureState("stopping");
 
     const stoppedRuntime = runtime.current;
-    const stoppedSegments = [...segments];
+    const stoppedSegments = [...segmentsRef.current];
     await stopRecorder(stoppedRuntime.recorder);
     setLastAudioChunks([...(stoppedRuntime.recordingChunks ?? [])]);
     runtime.current.nodes?.forEach((node) => node.disconnect());
     runtime.current.streams?.forEach((stream) => stream.getTracks().forEach((track) => track.stop()));
-    runtime.current.socket?.close();
+    const stoppedSocket = runtime.current.socket;
+    runtime.current.socket = undefined;
+    stoppedSocket?.close();
     await runtime.current.audioContext?.close().catch(() => undefined);
 
     runtime.current = {};
     setSocketState("offline");
     setCaptureState("idle");
+    setFileProgress((current) => current && current.stage !== "complete" && current.stage !== "error" ? { ...current, stage: "stopped", percent: null } : current);
 
-    if (autoExport && exportDirectory && stoppedSegments.some((segment) => !segment.partial)) {
+    if (!mediaFileRef.current && autoExport && exportDirectory && stoppedSegments.some((segment) => !segment.partial)) {
       await exportSession({ sourceSegments: stoppedSegments, audioChunks: stoppedRuntime.recordingChunks ?? [], includeText: true, includeAudio: true });
     }
   }
 
   function upsertSegment(segment: TranscriptSegment) {
-    setSegments((current) => {
-      const index = current.findIndex((item) => item.id === segment.id);
-      if (index === -1) return [...current, segment].slice(-250);
-      const next = [...current];
-      next[index] = segment;
-      return next;
-    });
+    const current = segmentsRef.current;
+    const index = current.findIndex((item) => item.id === segment.id);
+    const next = [...current];
+    if (index === -1) next.push(segment);
+    else next[index] = segment;
+    segmentsRef.current = next;
+    setSegments(next);
   }
 
   function clearTranscript() {
+    segmentsRef.current = [];
     setSegments([]);
+    mediaFileRef.current = null;
+    fileTranscriptPath.current = null;
+    setMediaFile(null);
+    setNotice(null);
     setSearchQuery("");
     setActiveHitIndex(0);
     setLastAudioChunks([]);
@@ -319,7 +377,7 @@ export function App() {
   }
 
   async function exportSession({
-    sourceSegments = segments,
+    sourceSegments = segmentsRef.current,
     audioChunks = runtime.current.recordingChunks ?? lastAudioChunks,
     includeText = true,
     includeAudio = true,
@@ -329,22 +387,41 @@ export function App() {
     includeText?: boolean;
     includeAudio?: boolean;
   } = {}) {
-    if (!exportDirectory) {
-      setLogs((current) => [...current.slice(-120), { stream: "stderr", text: "No export directory selected." }]);
-      return;
+    if (exportBusy.current) return;
+    exportBusy.current = true;
+    setExporting(true);
+    setNotice({ text: "Exporting…" });
+    try {
+      const directory = exportSettings.current.exportDirectory || await bridge.getDefaultExportDirectory();
+      if (!directory) throw new Error("Choose an export folder first.");
+      const finalText = includeText ? buildTranscriptText(sourceSegments) : undefined;
+      const audioSourcePath = includeAudio ? mediaFileRef.current?.path : undefined;
+      const hasAudio = Boolean(audioSourcePath || audioChunks.length);
+      if (includeText && !finalText) throw new Error("There is no finalized transcript to export yet.");
+      if (includeAudio && !includeText && !hasAudio) throw new Error("No audio is available. Transcribe a file or enable audio recording before listening.");
+      const audioBase64 = includeAudio && !audioSourcePath && audioChunks.length > 0 ? await blobToBase64(new Blob(audioChunks, { type: "audio/webm" })) : undefined;
+      const result = await bridge.saveSessionExport({
+        directory,
+        baseName: `livescriber-${new Date().toISOString().replace(/[:.]/g, "-")}`,
+        transcriptText: finalText,
+        audioBase64,
+        audioSourcePath,
+        includeText,
+        includeAudio: includeAudio && hasAudio,
+      });
+      const paths = [result.textPath, result.audioPath].filter(Boolean);
+      if (!paths.length) throw new Error("No files were exported.");
+      const text = `Saved ${paths.join(" and ")}${result.audioError ? `. Audio export failed: ${result.audioError}` : ""}`;
+      setNotice({ text, path: paths[0]!, error: Boolean(result.audioError) });
+      setLogs((current) => [...current.slice(-120), { stream: result.audioError ? "stderr" : "status", text }]);
+    } catch (error) {
+      const text = `Export failed: ${String(error)}`;
+      setNotice({ text, error: true });
+      setLogs((current) => [...current.slice(-120), { stream: "stderr", text }]);
+    } finally {
+      exportBusy.current = false;
+      setExporting(false);
     }
-
-    const finalText = includeText ? buildTranscriptText(sourceSegments) : undefined;
-    const audioBase64 = includeAudio && audioChunks.length > 0 ? await blobToBase64(new Blob(audioChunks, { type: "audio/webm" })) : undefined;
-    const result = await bridge.saveSessionExport({
-      directory: exportDirectory,
-      baseName: `livescriber-${new Date().toISOString().replace(/[:.]/g, "-")}`,
-      transcriptText: finalText,
-      audioBase64,
-      includeText,
-      includeAudio,
-    });
-    setLogs((current) => [...current.slice(-120), { stream: "status", text: `exported ${[result.textPath, result.audioPath].filter(Boolean).join(" and ")}` }]);
   }
 
   const livePartials = [...segments]
@@ -355,7 +432,7 @@ export function App() {
     }, {});
   const finalSegments = segments
     .filter((segment) => !segment.partial)
-    .sort((a, b) => b.end - a.end);
+    .sort((a, b) => mediaFile ? a.start - b.start || a.end - b.end : b.end - a.end);
   const normalizedSearch = searchQuery.trim().toLowerCase();
   let runningHitCount = 0;
   const searchRows = finalSegments.map((segment) => {
@@ -380,7 +457,7 @@ export function App() {
       <header className="window-bar">
         <div className="window-drag">
           <Captions size={15} />
-          <span>Livescriber</span>
+          <span>Livescriber {appVersion}</span>
         </div>
         <div className="window-actions">
           <button type="button" onClick={() => setSettingsOpen(true)} aria-label="Settings">
@@ -470,11 +547,11 @@ export function App() {
         </div>
 
         <div className="action-stack">
-          <button className="primary-button" type="button" onClick={captureState === "running" ? stopCapture : startCapture}>
+          <button className="primary-button" type="button" onClick={captureState === "running" ? stopCapture : startCapture} disabled={exporting || captureState === "starting" || captureState === "stopping"}>
             {captureState === "running" ? <CircleStop size={18} /> : <Play size={18} />}
-            {captureState === "running" ? "Stop listening" : "Start listening"}
+            {captureState === "running" ? mediaFile ? "Stop transcription" : "Stop listening" : "Start listening"}
           </button>
-          <button className="secondary-button" type="button" onClick={transcribeMediaFile} disabled={captureState !== "idle"}>
+          <button className="secondary-button" type="button" onClick={transcribeMediaFile} disabled={captureState !== "idle" || exporting}>
             <FileUp size={18} />
             Transcribe file
           </button>
@@ -482,9 +559,9 @@ export function App() {
             <div className="file-progress">
               <div>
                 <span>{fileProgressLabel(fileProgress)}</span>
-                <strong>{fileProgress.percent === null ? "Working" : `${Math.round(fileProgress.percent * 100)}%`}</strong>
+                <strong>{["error", "stopped"].includes(fileProgress.stage) ? "" : fileProgress.percent === null ? "Working" : `${Math.round(fileProgress.percent * 100)}%`}</strong>
               </div>
-              <div className={fileProgress.percent === null ? "progress-track indeterminate" : "progress-track"}>
+              <div className={fileProgress.percent === null && !["error", "stopped"].includes(fileProgress.stage) ? "progress-track indeterminate" : "progress-track"}>
                 <i style={{ width: `${Math.max(3, Math.round((fileProgress.percent ?? 0.08) * 100))}%` }} />
               </div>
             </div>
@@ -497,15 +574,15 @@ export function App() {
 
         <div className="sidebar-export">
           <p className="eyebrow">Export</p>
-          <button className="secondary-button" type="button" onClick={() => exportSession({ includeText: true, includeAudio: false })}>
+          <button className="secondary-button" type="button" onClick={() => exportSession({ includeText: true, includeAudio: false })} disabled={exporting}>
             <FileText size={16} />
             Export TXT
           </button>
-          <button className="secondary-button" type="button" onClick={() => exportSession({ includeText: false, includeAudio: true })}>
+          <button className="secondary-button" type="button" onClick={() => exportSession({ includeText: false, includeAudio: true })} disabled={exporting}>
             <FileAudio size={16} />
             Export audio
           </button>
-          <button className="ghost-button" type="button" onClick={chooseExportDirectory}>
+          <button className="ghost-button" type="button" onClick={openExportDirectory}>
             <Save size={16} />
             Folder
           </button>
@@ -526,8 +603,8 @@ export function App() {
       <section className="transcript-panel">
         <header className="panel-header">
           <div>
-            <p className="eyebrow">Live transcript</p>
-            <h2>Desktop audio</h2>
+            <p className="eyebrow">{mediaFile ? "File transcript" : "Live transcript"} · {finalSegments.length} segments</p>
+            <h2 className="transcript-title" title={mediaFile?.name}>{mediaFile?.name || "Desktop audio"}</h2>
           </div>
           <div className="transcript-tools">
             <div className="search-box">
@@ -553,7 +630,7 @@ export function App() {
                 </button>
               )}
             </div>
-            <button className="ghost-icon-button" type="button" onClick={clearTranscript} aria-label="Clear transcript">
+            <button className="ghost-icon-button" type="button" onClick={clearTranscript} aria-label="Clear transcript" disabled={captureState !== "idle" || exporting}>
               <SquareActivity size={18} />
             </button>
             <button className="ghost-icon-button" type="button" onClick={copyTranscript} aria-label="Copy transcript">
@@ -562,7 +639,7 @@ export function App() {
           </div>
         </header>
 
-        {!normalizedSearch && (
+        {!normalizedSearch && !mediaFile && (
           <div className="live-pair">
             <LiveLane speaker="Speaker 1" segment={livePartials["Speaker 1"]} />
             <LiveLane speaker="Speaker 2" segment={livePartials["Speaker 2"]} />
@@ -612,6 +689,12 @@ export function App() {
         </div>
       </section>
       </main>
+      {notice && (
+        <div className={`session-notice ${notice.error ? "error" : ""}`} role={notice.error ? "alert" : "status"}>
+          <p>{notice.text}</p>
+          {notice.path && <button className="secondary-button" type="button" onClick={() => bridge.showExportInFolder(notice.path!)}>Show in folder</button>}
+        </div>
+      )}
 
       {settingsOpen && (
         <div className="modal-backdrop" role="presentation" onMouseDown={() => setSettingsOpen(false)}>
@@ -628,18 +711,23 @@ export function App() {
 
             <div className="modal-section">
               <h3>Export</h3>
+              <p className="path-text">File transcripts always save to TXT automatically as speech is transcribed.</p>
+              <label className="check-row">
+                <input type="checkbox" checked={fileSpeakers} disabled={captureState !== "idle"} onChange={(event) => { setFileSpeakers(event.target.checked); localStorage.setItem("fileSpeakers", String(event.target.checked)); }} />
+                Identify speakers in files
+              </label>
               <label className="check-row">
                 <input type="checkbox" checked={recordAudio} onChange={(event) => updateRecordAudio(event.target.checked)} disabled={captureState !== "idle"} />
                 Record stereo audio
               </label>
               <label className="check-row">
                 <input type="checkbox" checked={autoExport} onChange={(event) => updateAutoExport(event.target.checked)} />
-                Export transcript and audio on stop
+                Export live transcript and audio on stop
               </label>
               <div className="folder-row">
                 <button className="ghost-button" type="button" onClick={chooseExportDirectory}>
                   <Save size={16} />
-                  Folder
+                  Change folder
                 </button>
                 <p className="path-text">{exportDirectory}</p>
               </div>
@@ -694,6 +782,9 @@ function AudioMeter({ label, stats }: { label: string; stats: AudioStats }) {
 }
 
 function fileProgressLabel(progress: FileProgress) {
+  if (progress.stage === "speakers") return progress.percent === null ? "Preparing speaker detection" : `Identifying speakers ${Math.round(progress.percent * 100)}%`;
+  if (progress.stage === "error") return "Transcription failed";
+  if (progress.stage === "stopped") return "Stopped";
   const stage = progress.stage === "retry" ? "Retrying without VAD" : progress.stage === "decode" ? "Reading audio" : progress.stage === "complete" ? "Complete" : "Transcribing";
   if (!progress.total || progress.percent === null) return stage;
   return `${stage} ${formatTime(progress.current)} / ${formatTime(progress.total)}`;
@@ -866,13 +957,14 @@ async function blobToBase64(blob: Blob) {
 function buildTranscriptText(sourceSegments: TranscriptSegment[]) {
   return sourceSegments
     .filter((segment) => !segment.partial)
-    .sort((a, b) => b.end - a.end)
+    .sort((a, b) => a.start - b.start || a.end - b.end)
     .map((segment) => `[${formatTime(segment.start)} - ${formatTime(segment.end)}] ${segment.speaker}: ${segment.text}`)
     .join("\n");
 }
 
 function speakerClass(speaker: string) {
-  return speaker.toLowerCase().includes("2") ? "speaker-two" : "speaker-one";
+  const number = Number(speaker.match(/\d+/)?.[0] ?? 0);
+  return number === 1 ? "speaker-one" : number === 2 ? "speaker-two" : number ? `speaker-extra speaker-${number % 4}` : "speaker-unknown";
 }
 
 function countMatches(text: string, query: string) {

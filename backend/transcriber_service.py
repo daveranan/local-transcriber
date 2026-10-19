@@ -3,6 +3,8 @@ import base64
 import json
 import os
 import sys
+import threading
+import tempfile
 import time
 from collections import deque
 from dataclasses import dataclass, field
@@ -11,6 +13,9 @@ from typing import Optional
 
 import numpy as np
 import websockets
+from websockets.exceptions import ConnectionClosed
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from speaker_diarization import SpeakerTimeline
 
 
 DLL_HANDLES = []
@@ -80,20 +85,11 @@ class SourceState:
     segment_count: int = 0
 
 
-class SpeakerLabeler:
-    def __init__(self) -> None:
-        self.enabled = False
-
-    def label(self, _audio: np.ndarray, _start: float, _end: float) -> str:
-        return "Speaker 1"
-
-
 class Transcriber:
     def __init__(self) -> None:
         self.model = None
         self.load_error = None
         self.loading = False
-        self.speaker_labeler = SpeakerLabeler()
 
     def load(self) -> None:
         self.loading = True
@@ -124,6 +120,9 @@ class Transcriber:
         vad_filter: bool = True,
         progress=None,
         duration: float = 0.0,
+        on_segment=None,
+        cancelled=None,
+        speaker_timeline=None,
     ) -> list[dict]:
         if self.model is None:
             return []
@@ -135,11 +134,13 @@ class Transcriber:
             beam_size=1,
             vad_filter=vad_filter,
             condition_on_previous_text=False,
-            word_timestamps=False,
+            word_timestamps=speaker_timeline is not None,
         )
 
         result = []
         for segment in segments:
+            if cancelled and cancelled.is_set():
+                break
             if progress and duration > 0:
                 progress(float(segment.end), duration)
             text = segment.text.strip()
@@ -149,13 +150,30 @@ class Transcriber:
             if not vad_filter and no_speech_prob > 0.65:
                 continue
 
-            result.append({
-                "speaker": self.speaker_labeler.label(audio, float(segment.start), float(segment.end)),
+            recognized = {
+                "speaker": speaker_timeline.label(float(segment.start), float(segment.end)) if speaker_timeline else "Speaker 1",
                 "text": text,
                 "start": float(segment.start),
                 "end": float(segment.end),
                 "confidence": 1.0 - float(getattr(segment, "avg_logprob", -1.0) * -1.0),
-            })
+            }
+            # Whisper sentences may cross speaker changes. Assign individual
+            # words first so the transcript can split at the actual turn.
+            groups = []
+            words = getattr(segment, "words", None) if speaker_timeline else None
+            for word in words or []:
+                speaker = speaker_timeline.label(float(word.start), float(word.end))
+                if groups and groups[-1]["speaker"] == speaker:
+                    groups[-1]["text"] += word.word
+                    groups[-1]["end"] = float(word.end)
+                else:
+                    groups.append({**recognized, "speaker": speaker, "text": word.word, "start": float(word.start), "end": float(word.end)})
+            for recognized_group in groups or [recognized]:
+                recognized_group["text"] = recognized_group["text"].strip()
+                if recognized_group["text"]:
+                    result.append(recognized_group)
+                    if on_segment:
+                        on_segment(recognized_group)
         return result
 
     def decode_file_audio(self, file_path: str, sample_rate: int) -> tuple[np.ndarray, dict]:
@@ -218,7 +236,7 @@ class ClientSession:
             source_name = str(message.get("source") or "desktop")
             source = self.sources.get(source_name) or SourceState(source_name, "Speaker 1")
             self.sources[source_name] = source
-            await self.transcribe_file(file_path, source)
+            await self.transcribe_file(file_path, source, message.get("transcriptPath"))
             return
 
         if message_type == "audio":
@@ -242,16 +260,25 @@ class ClientSession:
                 if len(source.buffer) > max_bytes:
                     del source.buffer[: len(source.buffer) - max_bytes]
 
-    async def transcribe_file(self, file_path: str, source: SourceState) -> None:
+    async def transcribe_file(self, file_path: str, source: SourceState, transcript_path: Optional[str] = None) -> None:
         if not file_path or not Path(file_path).exists():
-            await self.send_status(f"file not found: {file_path}")
+            await self.send_file_error(f"File not found: {file_path}")
             return
         if self.transcriber.loading:
             await self.send_status("model still loading")
             while self.transcriber.loading:
                 await asyncio.sleep(0.25)
+        if self.transcriber.model is None:
+            await self.send_file_error(f"Transcription model unavailable: {self.transcriber.load_error}")
+            return
         await self.send_status(f"transcribing file: {Path(file_path).name}")
+        await self.send_progress("decode", None, 0.0, 0.0)
+        self.transcript_file = None
         try:
+            if transcript_path:
+                # The main process creates a unique file before starting work.
+                # Flush each segment so completed text survives interruption.
+                self.transcript_file = open(transcript_path, "a", encoding="utf-8")
             audio, stats = await asyncio.to_thread(self.transcriber.decode_file_audio, file_path, self.config.sample_rate)
             await self.send_progress("decode", 0.02, 0.0, stats["duration"])
             await self.send_status(
@@ -261,39 +288,101 @@ class ClientSession:
                 await self.send_status("file has no decodable audio or is silent")
                 segments = []
             else:
-                segments = await self.transcribe_audio_with_progress(audio, stats["duration"], True, "transcribe")
+                timeline = await self.identify_file_speakers(audio, stats["duration"]) if self.config.diarization else None
+                segments = await self.transcribe_audio_with_progress(audio, stats["duration"], True, "transcribe", source, timeline)
                 if not segments:
                     await self.send_status("no speech detected with VAD; retrying without VAD")
                     await self.send_progress("retry", 0.0, 0.0, stats["duration"])
-                    segments = await self.transcribe_audio_with_progress(audio, stats["duration"], False, "retry")
+                    segments = await self.transcribe_audio_with_progress(audio, stats["duration"], False, "retry", source, timeline)
+        except ConnectionClosed:
+            return
         except Exception as exc:
-            await self.send_status(f"file transcribe error: {exc}")
+            await self.send_file_error(f"File transcription failed: {exc}")
             print(f"file transcribe error: {exc}", flush=True)
             return
+        finally:
+            if self.transcript_file:
+                self.transcript_file.close()
+                self.transcript_file = None
         if not segments:
             await self.send_status("file has audio, but no speech was recognized")
 
-        for index, segment in enumerate(segments, start=1):
-            await self.websocket.send(json.dumps({
-                "type": "segment",
-                "segment": {
-                    "id": f"file-{index}-{time.monotonic()}",
-                    "speaker": source.speaker,
-                    "text": segment["text"],
-                    "start": segment["start"],
-                    "end": segment["end"],
-                    "partial": False,
-                    "confidence": segment.get("confidence"),
-                },
-            }))
         await self.send_progress("complete", 1.0, stats["duration"] if "stats" in locals() else 0.0, stats["duration"] if "stats" in locals() else 0.0)
         await self.send_status(f"file transcription complete: {len(segments)} segments")
+        await self.websocket.send(json.dumps({"type": "file_complete", "segments": len(segments), "duration": stats["duration"], "transcriptPath": transcript_path, "speakers": len({segment["speaker"] for segment in segments})}))
 
-    async def transcribe_audio_with_progress(self, audio: np.ndarray, duration: float, vad_filter: bool, stage: str) -> list[dict]:
-        progress_events = deque()
+    async def identify_file_speakers(self, audio: np.ndarray, duration: float):
+        await self.send_progress("speakers", None, 0.0, duration)
+        # sherpa's Python binding holds the GIL during native inference. Run it
+        # in its own process so websocket progress, heartbeats and Stop work.
+        with tempfile.TemporaryDirectory(prefix="livescriber-speakers-") as directory:
+            samples_path = str(Path(directory) / "audio.npy")
+            await asyncio.to_thread(np.save, samples_path, audio)
+            worker = await asyncio.create_subprocess_exec(
+                sys.executable, "-B", "-u", str(Path(__file__).with_name("speaker_diarization.py")), samples_path,
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+                limit=8 * 1024 * 1024,
+                creationflags=0x08000000 if os.name == "nt" else 0,
+            )
+            async def read_results():
+                timeline = None
+                async for raw in worker.stdout:
+                    message = json.loads(raw)
+                    if message["type"] == "progress":
+                        ratio = message["processed"] / max(1, message["total"])
+                        await self.send_progress("speakers", ratio, duration * ratio, duration)
+                    elif message["type"] == "speakers":
+                        # SpeakerTimeline normalizes labels by first appearance.
+                        timeline = SpeakerTimeline(message["turns"])
+                return timeline
+            results = asyncio.create_task(read_results())
+            errors = asyncio.create_task(worker.stderr.read())
+            disconnected = asyncio.create_task(self.websocket.wait_closed())
+            try:
+                await asyncio.wait([results, disconnected], return_when=asyncio.FIRST_COMPLETED)
+                if disconnected.done():
+                    raise asyncio.CancelledError()
+                timeline = await results
+                code = await worker.wait()
+                error = (await errors).decode(errors="replace").strip()
+                if code != 0 or timeline is None:
+                    raise RuntimeError(f"Speaker detection failed: {error or f'worker exited with {code}'}")
+                return timeline
+            finally:
+                disconnected.cancel()
+                if worker.returncode is None:
+                    worker.terminate()
+                    await worker.wait()
+                results.cancel()
+                await asyncio.gather(results, errors, disconnected, return_exceptions=True)
+
+    async def transcribe_audio_with_progress(self, audio: np.ndarray, duration: float, vad_filter: bool, stage: str, source: SourceState, speaker_timeline=None) -> list[dict]:
+        events = deque()
+        cancelled = threading.Event()
 
         def collect_progress(current: float, total: float) -> None:
-            progress_events.append((current, total))
+            events.append(("progress", (current, total)))
+
+        def collect_segment(segment: dict) -> None:
+            events.append(("segment", segment))
+
+        async def drain_events() -> None:
+            while events:
+                kind, value = events.popleft()
+                if kind == "progress":
+                    current, total = value
+                    await self.send_progress(stage, current / max(0.001, total), current, total)
+                else:
+                    source.segment_count += 1
+                    if self.transcript_file:
+                        def stamp(seconds):
+                            return f"{int(seconds // 60):02}:{int(seconds % 60):02}"
+                        self.transcript_file.write(f"[{stamp(value['start'])} - {stamp(value['end'])}] {value['speaker']}: {value['text']}\n")
+                        self.transcript_file.flush()
+                    await self.websocket.send(json.dumps({
+                        "type": "segment",
+                        "segment": {**value, "id": f"file-{self.started_at}-{source.segment_count}", "partial": False},
+                    }))
 
         task = asyncio.create_task(asyncio.to_thread(
             self.transcriber.transcribe,
@@ -302,23 +391,28 @@ class ClientSession:
             vad_filter,
             collect_progress,
             duration,
+            collect_segment,
+            cancelled,
+            speaker_timeline,
         ))
-        last_ping = time.monotonic()
-        while not task.done():
-            while progress_events:
-                current, total = progress_events.popleft()
-                await self.send_progress(stage, current / max(0.001, total), current, total)
-                last_ping = time.monotonic()
-            if time.monotonic() - last_ping > 1.0:
-                await self.send_progress(stage, None, 0.0, duration)
-                last_ping = time.monotonic()
-            await asyncio.sleep(0.2)
-
-        segments = await task
-        while progress_events:
-            current, total = progress_events.popleft()
-            await self.send_progress(stage, current / max(0.001, total), current, total)
-        return segments
+        disconnected = asyncio.create_task(self.websocket.wait_closed())
+        try:
+            while not task.done():
+                if disconnected.done():
+                    cancelled.set()
+                    await task
+                    raise asyncio.CancelledError()
+                await drain_events()
+                await asyncio.wait([task, disconnected], timeout=0.2, return_when=asyncio.FIRST_COMPLETED)
+            segments = await task
+            await drain_events()
+            return segments
+        finally:
+            cancelled.set()
+            disconnected.cancel()
+            # Retrieve a worker exception even when the websocket has gone away.
+            if not task.done():
+                await asyncio.gather(task, return_exceptions=True)
 
     async def process_loop(self) -> None:
         while not self.closed:
@@ -412,6 +506,10 @@ class ClientSession:
 
     async def send_status(self, message: str) -> None:
         await self.websocket.send(json.dumps({ "type": "status", "message": message }))
+
+    async def send_file_error(self, message: str) -> None:
+        await self.send_status(message)
+        await self.websocket.send(json.dumps({"type": "file_error", "message": message}))
 
     async def send_progress(self, stage: str, percent: Optional[float], current: float, total: float) -> None:
         await self.websocket.send(json.dumps({

@@ -454,6 +454,39 @@ select {
   min-height: 68px;
 }
 
+.panel-header > div:first-child {
+  min-width: 0;
+}
+
+.transcript-title {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.session-notice {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 16px;
+  border-top: 1px solid #303743;
+  background: #141821;
+  font-size: 12px;
+}
+
+.session-notice p {
+  flex: 1;
+  overflow-wrap: anywhere;
+}
+
+.session-notice button {
+  flex-shrink: 0;
+}
+
+.session-notice.error {
+  color: #ffd8dc;
+}
+
 .transcript-tools {
   display: flex;
   align-items: center;
@@ -544,6 +577,12 @@ select {
   background: #214b37;
   color: #d8ffe8;
 }
+
+.speaker-extra .speaker-pill { background: #313f70; color: #e3e8ff; }
+.speaker-extra.speaker-0 .speaker-pill { background: #684923; color: #fff0d8; }
+.speaker-extra.speaker-1 .speaker-pill { background: #61346d; color: #f9ddff; }
+.speaker-extra.speaker-2 .speaker-pill { background: #22555b; color: #d6fbff; }
+.speaker-unknown .speaker-pill { background: #3a404b; color: #d1d5db; }
 
 .live-strip.speaker-two .speaker-pill {
   grid-column: 3;

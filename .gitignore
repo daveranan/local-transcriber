@@ -5,3 +5,4 @@ release/
 venv/
 .codex-*.log
 *.local
+__pycache__/

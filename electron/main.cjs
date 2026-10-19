@@ -1,4 +1,5 @@
-const { app, BrowserWindow, Menu, Tray, clipboard, desktopCapturer, dialog, ipcMain, nativeImage, session, globalShortcut } = require("electron");
+const { app, BrowserWindow, Menu, Tray, clipboard, desktopCapturer, dialog, ipcMain, nativeImage, session, globalShortcut, shell } = require("electron");
+const { saveSessionExport, createFileTranscript } = require("./session-export.cjs");
 const { autoUpdater } = require("electron-updater");
 const { spawn } = require("node:child_process");
 const crypto = require("node:crypto");
@@ -13,6 +14,13 @@ let selectedSourceId = null;
 let serviceProcess = null;
 let serviceStatus = { running: false, port: 8765, pid: null };
 let backendInstallPromise = null;
+const ownsInstance = app.requestSingleInstanceLock();
+if (!ownsInstance) app.quit();
+app.on("second-instance", () => {
+  if (mainWindow?.isMinimized()) mainWindow.restore();
+  mainWindow?.show();
+  mainWindow?.focus();
+});
 
 const appDir = app.isPackaged ? app.getAppPath() : path.join(__dirname, "..");
 const resourceDir = app.isPackaged ? process.resourcesPath : appDir;
@@ -27,7 +35,7 @@ function createWindow() {
     height: 760,
     minWidth: 860,
     minHeight: 560,
-    title: "Livescriber",
+    title: `Livescriber ${app.getVersion()}`,
     frame: false,
     backgroundColor: "#0f1115",
     webPreferences: {
@@ -276,8 +284,10 @@ async function startService() {
     broadcast("service:log", { stream: "stderr", text: chunk.toString() });
   });
 
+  const startedProcess = serviceProcess;
   serviceProcess.on("exit", (code, signal) => {
     broadcast("service:log", { stream: "status", text: `transcriber exited code=${code} signal=${signal}` });
+    if (serviceProcess !== startedProcess) return;
     serviceProcess = null;
     serviceStatus = { running: false, installing: false, port, pid: null };
     broadcast("service:status", serviceStatus);
@@ -288,7 +298,14 @@ async function startService() {
 
 function stopService() {
   if (serviceProcess) {
-    serviceProcess.kill();
+    const child = serviceProcess;
+    if (process.platform === "win32" && child.pid) {
+      // The speaker detector is a child process; stop the complete backend tree.
+      spawn("taskkill.exe", ["/PID", String(child.pid), "/T", "/F"], { windowsHide: true, stdio: "ignore" })
+        .on("error", () => child.kill());
+    } else {
+      child.kill();
+    }
     serviceProcess = null;
   }
   serviceStatus = { ...serviceStatus, running: false, installing: false, pid: null };
@@ -304,16 +321,13 @@ function quitApp() {
 
 function configureUpdater() {
   autoUpdater.autoDownload = true;
+  autoUpdater.autoInstallOnAppQuit = false;
   autoUpdater.on("checking-for-update", () => broadcast("update:status", { status: "checking" }));
   autoUpdater.on("update-available", (info) => broadcast("update:status", { status: "available", version: info.version }));
   autoUpdater.on("update-not-available", () => broadcast("update:status", { status: "none" }));
   autoUpdater.on("download-progress", (progress) => broadcast("update:status", { status: "downloading", percent: progress.percent }));
   autoUpdater.on("update-downloaded", (info) => broadcast("update:status", { status: "downloaded", version: info.version }));
   autoUpdater.on("error", (error) => broadcast("update:status", { status: "error", message: error.message }));
-}
-
-function safeFileName(value) {
-  return value.replace(/[<>:"/\\|?*\x00-\x1F]/g, "-").slice(0, 120);
 }
 
 ipcMain.handle("capture:get-sources", async () => {
@@ -352,6 +366,7 @@ ipcMain.handle("file:choose-media", async () => {
 ipcMain.handle("service:start", () => startService());
 ipcMain.handle("service:stop", () => stopService());
 ipcMain.handle("service:status", () => serviceStatus);
+ipcMain.handle("app:version", () => app.getVersion());
 ipcMain.handle("clipboard:write-text", (_event, text) => {
   clipboard.writeText(text || "");
   return true;
@@ -365,28 +380,23 @@ ipcMain.handle("export:choose-directory", async () => {
 ipcMain.handle("export:default-directory", () => {
   return path.join(app.getPath("documents"), "Livescriber");
 });
+ipcMain.handle("file:create-transcript", (_event, payload) => {
+  return createFileTranscript(payload.directory || path.join(app.getPath("documents"), "Livescriber"), payload.fileName);
+});
+ipcMain.handle("export:open-directory", async (_event, directory) => {
+  const destination = directory || path.join(app.getPath("documents"), "Livescriber");
+  await fs.promises.mkdir(destination, { recursive: true });
+  const error = await shell.openPath(destination);
+  if (error) throw new Error(error);
+});
 ipcMain.handle("export:save-session", async (_event, payload) => {
-  const directory = payload.directory;
-  if (!directory) {
-    throw new Error("Export directory is required.");
-  }
-  fs.mkdirSync(directory, { recursive: true });
-
-  const stamp = safeFileName(new Date().toISOString().replace(/[:.]/g, "-"));
-  const baseName = safeFileName(payload.baseName || `livescriber-${stamp}`);
-  let textPath = null;
-  if (payload.includeText !== false) {
-    textPath = path.join(directory, `${baseName}.txt`);
-    fs.writeFileSync(textPath, payload.transcriptText || "", "utf8");
-  }
-
-  let audioPath = null;
-  if (payload.includeAudio !== false && payload.audioBase64) {
-    audioPath = path.join(directory, `${baseName}.webm`);
-    fs.writeFileSync(audioPath, Buffer.from(payload.audioBase64, "base64"));
-  }
-
-  return { textPath, audioPath };
+  return saveSessionExport(payload, async (source, destination) => {
+    const python = await ensureBackendRuntime();
+    await runBackendCommand(python, [path.join(resourceDir, "backend", "export_audio.py"), source, destination], { cwd: resourceDir });
+  });
+});
+ipcMain.handle("export:show-in-folder", (_event, filePath) => {
+  shell.showItemInFolder(filePath);
 });
 ipcMain.handle("update:check", () => {
   if (!app.isPackaged) {
@@ -406,6 +416,7 @@ ipcMain.handle("window:maximize", () => {
 ipcMain.handle("window:close", () => mainWindow?.close());
 
 app.whenReady().then(() => {
+  if (!ownsInstance) return;
   configureUpdater();
   configureMediaPermissions();
   configureDisplayCapture();
