@@ -46,7 +46,8 @@ jobs:
           python-version: '3.13'
 
       - name: Install backend test dependencies
-        run: python -m pip install --only-binary=:all: numpy==2.4.6 websockets==16.0 av==17.0.1
+        run: >-
+          python -m pip install --only-binary=:all: numpy==2.4.6 websockets==16.0 av==17.0.1
 
       - name: Verify file streaming and speaker assignment
         run: powershell -NoProfile -ExecutionPolicy Bypass -File scripts/run-limited.ps1 python -B backend/test_file_transcription.py
